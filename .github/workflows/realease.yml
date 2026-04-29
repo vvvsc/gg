@@ -1,0 +1,97 @@
+name: Sign & Publish Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'   # Disparar con tags como v1.0.0, v2.3.1, etc.
+
+permissions:
+  contents: write  # Necesario para crear releases
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Instalar dependencias
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gnupg tar jq curl
+
+      - name: Importar clave GPG privada
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          # Verificar que se importó correctamente
+          gpg --list-secret-keys --keyid-format LONG
+
+      - name: Preparar archivos a publicar
+        run: |
+          # Crear directorio de staging
+          mkdir -p _release_staging
+
+          # Copiar archivos a publicar (ajustá este glob a tu estructura)
+          # Por defecto toma todo lo que NO es metadata del repo
+          rsync -av \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='_release_staging' \
+            --exclude='*.sig' \
+            --exclude='manifest.json' \
+            . _release_staging/
+
+      - name: Comprimir, firmar y generar manifest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          bash .github/scripts/sign_and_package.sh "$TAG"
+
+      - name: Crear GitHub Release y subir assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          RELEASE_DIR="_dist"
+
+          # Crear el release via API REST de GitHub
+          RELEASE_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/releases" \
+            -d "{
+              \"tag_name\": \"${TAG}\",
+              \"name\": \"Release ${TAG}\",
+              \"body\": \"Release firmado con GPG. Verificá la firma con la clave pública del repositorio.\",
+              \"draft\": false,
+              \"prerelease\": false
+            }")
+
+          UPLOAD_URL=$(echo "$RELEASE_RESPONSE" | jq -r '.upload_url' | sed 's/{?name,label}//')
+
+          if [ -z "$UPLOAD_URL" ] || [ "$UPLOAD_URL" = "null" ]; then
+            echo "Error creando el release:"
+            echo "$RELEASE_RESPONSE"
+            exit 1
+          fi
+
+          echo "Upload URL: $UPLOAD_URL"
+
+          # Subir cada archivo del directorio de distribución
+          for FILE in "$RELEASE_DIR"/*; do
+            FILENAME=$(basename "$FILE")
+            echo "Subiendo $FILENAME..."
+            curl -s -X POST \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              "${UPLOAD_URL}?name=${FILENAME}" \
+              --data-binary "@$FILE"
+            echo ""
+          done
+
+          echo "✅ Release ${TAG} publicado exitosamente."
